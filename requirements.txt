@@ -1,0 +1,3 @@
+aiogram>=3.0.0
+requests==2.31.0
+libtorrent-rasterbar==2.0.9
