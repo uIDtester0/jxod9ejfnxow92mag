@@ -1,94 +1,96 @@
 import os
 import asyncio
-import libtorrent as lt
-import requests
+import tempfile
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 
-# Конфигурация
-API_TOKEN = "7471696949:AAGP6xmotd0RPRhgI2j1x_0AaZHHUmQlbEI"
-DOWNLOADS_DIR = "downloads"
-WORMHOLE_API = "https://wormhole.app/api/v1"
+API_TOKEN = '7471696949:AAGP6xmotd0RPRhgI2j1x_0AaZHHUmQlbEI'
+WORMHOLE_TIMEOUT = 60 * 60  # 1 hour timeout for wormhole
 
-# Инициализация бота
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
-# Скачивание торрента по magnet-ссылке
-async def download_torrent(magnet_link: str):
-    ses = lt.session()
-    params = {
-        "save_path": DOWNLOADS_DIR,
-        "storage_mode": lt.storage_mode_t.storage_mode_sparse,
-    }
+async def download_torrent(magnet_link, download_dir):
+    command = [
+        'aria2c',
+        '--dir=' + download_dir,
+        '--seed-time=0',
+        '--enable-dht=false',
+        '--disable-ipv6=true',
+        '--quiet=true',
+        magnet_link
+    ]
     
-    handle = lt.add_magnet_uri(ses, magnet_link, params)
-    ses.start_dht()
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    
+    await process.wait()
+    return process.returncode == 0
 
-    # Ожидание метаданных
-    while not handle.has_metadata():
-        await asyncio.sleep(1)
+async def send_via_wormhole(file_path):
+    command = [
+        'wormhole',
+        'send',
+        '--hide-progress',
+        '--code-length=2',
+        file_path
+    ]
     
-    # Скачивание файла
-    while handle.status().state != lt.torrent_status.seeding:
-        status = handle.status()
-        print(f"Прогресс: {status.progress * 100:.1f}%")
-        await asyncio.sleep(5)
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
     
-    return os.path.join(DOWNLOADS_DIR, handle.name())
-
-# Загрузка на Wormhole.app
-def upload_to_wormhole(file_path: str):
     try:
-        # Создание "червяка" (временного хранилища)
-        response = requests.post(
-            f"{WORMHOLE_API}/worms",
-            json={"ttl": 86400}  # Время жизни файла: 24 часа
-        )
-        worm_id = response.json()["id"]
-
-        # Загрузка файла
-        with open(file_path, "rb") as f:
-            requests.put(
-                f"{WORMHOLE_API}/worms/{worm_id}/file",
-                files={"file": f}
-            )
-
-        return f"https://wormhole.app/{worm_id}#"
-
-    except Exception as e:
-        raise Exception(f"Ошибка загрузки: {str(e)}")
-
-# Обработчики сообщений
-@dp.message_handler(commands=["start"])
-async def start(message: types.Message):
-    await message.answer("Отправьте magnet-ссылку для скачивания файла.")
-
-@dp.message_handler(lambda msg: msg.text.startswith("magnet:"))
-async def process_magnet(message: types.Message):
-    try:
-        # Скачивание файла
-        await message.answer("⏳ Начинаю скачивание...")
-        file_path = await download_torrent(message.text)
-
-        # Загрузка на Wormhole
-        await message.answer("🚀 Загружаю файл на Wormhole.app...")
-        download_url = upload_to_wormhole(file_path)
-
-        # Отправка ссылки
-        await message.answer(f"✅ Файл готов! Ссылка для скачивания:\n{download_url}")
-
-        # Удаление локального файла
-        os.remove(file_path)
-
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {str(e)}")
-        if "file_path" in locals():
-            os.remove(file_path)
-
-if __name__ == "__main__":
-    # Создание папки для загрузок
-    if not os.path.exists(DOWNLOADS_DIR):
-        os.makedirs(DOWNLOADS_DIR)
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=WORMHOLE_TIMEOUT)
+    except asyncio.TimeoutError:
+        process.kill()
+        return None
     
+    if process.returncode != 0:
+        return None
+    
+    return stdout.decode().strip()
+
+async def process_magnet(magnet_link):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        success = await download_torrent(magnet_link, temp_dir)
+        if not success:
+            return None
+        
+        files = [f for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f))]
+        if not files:
+            return None
+        
+        largest_file = max(files, key=lambda f: os.path.getsize(os.path.join(temp_dir, f)))
+        file_path = os.path.join(temp_dir, largest_file)
+        
+        return await send_via_wormhole(file_path)
+
+@dp.message_handler(commands=['start', 'help'])
+async def send_welcome(message: types.Message):
+    await message.reply("Отправьте мне magnet-ссылку, и я перешлю вам файл через Wormhole!")
+
+@dp.message_handler(regexp=r'^magnet:\?xt=urn:btih:[a-zA-Z0-9]+.*')
+async def handle_magnet(message: types.Message):
+    msg = await message.reply("⏳ Обрабатываю magnet-ссылку...")
+    magnet_link = message.text
+    
+    try:
+        wormhole_url = await process_magnet(magnet_link)
+        if wormhole_url:
+            await msg.edit_text(f"✅ Файл готов к скачиванию:\n{wormhole_url}")
+        else:
+            await msg.edit_text("❌ Не удалось обработать файл")
+    except Exception as e:
+        await msg.edit_text(f"⚠️ Произошла ошибка: {str(e)}")
+    finally:
+        # Additional cleanup if needed
+        pass
+
+if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
